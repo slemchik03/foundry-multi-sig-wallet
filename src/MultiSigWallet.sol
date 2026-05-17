@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.24;
+
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 // @note Confirmation count should always be LESS than signers count
 // because when signer initiates a voting for tx execution it automatically
 // confirms that proposal from contract perspective
-error MultiSigWallet__MoreConfirmationsThanSigners(
-    uint _confirmations,
-    uint _signers
-);
+error MultiSigWallet__MoreConfirmationsThanSigners(uint256 _confirmations, uint256 _signers);
 error MultiSigWallet__ShouldBeAtLeastOneConfirmation();
 error MultiSigWallet__EmptySigners();
-error MultiSigWallet_SignersShouldBeUnique(
-    uint _firstOccurIdx,
-    uint _secondOccurIdx
-);
+error MultiSigWallet_SignersShouldBeUnique(uint256 _firstOccurIdx, uint256 _secondOccurIdx);
 error MultiSigWallet__OnlySignersAllowed(address _sender);
+error MultiSigWallet__FailedToExecuteTx();
 error MultiSigWallet__InvalidDeadline();
 error MultiSigWallet__InsufficientBalance(uint256 _asked, uint256 _got);
 error MultiSigWallet__InvalidNonce();
@@ -26,17 +23,19 @@ error MultiSigWallet__InsufficientTxConfirmations();
 error MultiSigWallet__CannotRevokeYet();
 error MultiSigWallet__InvalidSigner();
 
+event Deposit(address indexed from, uint256 amount);
+
 struct Tx {
     address initiator;
-    uint256 value;
-    address to;
-    bytes data;
-    uint256 deadline;
-    uint256 confirmationsCount;
+    uint64 deadline;
     bool executed;
+    uint64 confirmationsCount;
+    address to;
+    uint256 value;
+    bytes data;
 }
 
-contract MultiSigWallet {
+contract MultiSigWallet is ReentrancyGuard {
     address[] signers;
     mapping(uint256 => mapping(address => bool)) txConfirmers;
     mapping(uint256 => Tx) nonceToTx;
@@ -44,7 +43,6 @@ contract MultiSigWallet {
     uint256 internal nonce;
     uint256 immutable i_maxSignersCount;
     uint256 immutable i_requiredConfirmationCount;
-
     event TxExecuted(uint256 _txId, bytes _txResult);
     event TransactionProposed(uint256 indexed txId, address indexed initiator);
     event TransactionConfirmed(uint256 indexed txId, address indexed signer);
@@ -61,10 +59,7 @@ contract MultiSigWallet {
         _;
     }
     modifier onlyTxOwner(uint256 _nonce) {
-        require(
-            msg.sender == nonceToTx[_nonce].initiator,
-            "Error you should be a tx owner!"
-        );
+        require(msg.sender == nonceToTx[_nonce].initiator, "Error you should be a tx owner!");
         _;
     }
 
@@ -77,67 +72,57 @@ contract MultiSigWallet {
         }
         // It should be >, not >=, to allow the case where required confirmations equals the number of signers.
         if (_requiredConfirmationCount > _signers.length) {
-            revert MultiSigWallet__MoreConfirmationsThanSigners(
-                _requiredConfirmationCount,
-                _signers.length
-            );
+            revert MultiSigWallet__MoreConfirmationsThanSigners(_requiredConfirmationCount, _signers.length);
         }
 
-        (int n1, int n2) = isUnique(_signers);
+        (int256 n1, int256 n2) = isUnique(_signers);
         if (n1 != -1 && n2 != -1) {
-            revert MultiSigWallet_SignersShouldBeUnique(uint(n1), uint(n2));
+            revert MultiSigWallet_SignersShouldBeUnique(uint256(n1), uint256(n2));
         }
 
         signers = _signers;
         i_requiredConfirmationCount = _requiredConfirmationCount;
         i_maxSignersCount = _signers.length;
-        nonce = 0;
     }
 
-    function proposeTx(
-        address _txAddress,
-        uint256 _txValue,
-        uint256 _txDeadline,
-        bytes calldata _txData
-    ) external onlySigners {
+    function proposeTx(address _txAddress, uint64 _txValue, uint64 _txDeadline, bytes calldata _txData)
+        external
+        onlySigners
+    {
         if (_txDeadline <= block.timestamp) {
             revert MultiSigWallet__InvalidDeadline();
         }
         if (_txValue > address(this).balance) {
-            revert MultiSigWallet__InsufficientBalance(
-                _txValue,
-                address(this).balance
-            );
+            revert MultiSigWallet__InsufficientBalance(_txValue, address(this).balance);
         }
 
         Tx memory transaction = Tx(
             msg.sender,
-            _txValue,
-            _txAddress,
-            _txData,
             _txDeadline,
+            false,
             1, // Start with 1 confirmation (initiator's)
-            false
+            _txAddress,
+            _txValue,
+            _txData
         );
         txConfirmers[nonce][msg.sender] = true;
         nonceToTx[nonce] = transaction;
-
         emit TransactionProposed(nonce, msg.sender);
         nonce++;
     }
 
-    function confirmTx(uint256 _nonce) external onlySigners validTx(_nonce) {
+    function confirmTx(uint256 _nonce) external nonReentrant onlySigners validTx(_nonce) {
         if (txConfirmers[_nonce][msg.sender]) {
             revert MultiSigWallet__AlreadyConfirmed();
         }
-
         txConfirmers[_nonce][msg.sender] = true;
+
         nonceToTx[_nonce].confirmationsCount++;
 
         emit TransactionConfirmed(_nonce, msg.sender);
     }
 
-    function executeTx(uint256 _nonce) external onlySigners validTx(_nonce) {
+    function executeTx(uint256 _nonce) external onlySigners validTx(_nonce) nonReentrant {
         Tx storage el = nonceToTx[_nonce];
         if (el.confirmationsCount < i_requiredConfirmationCount) {
             revert MultiSigWallet__InsufficientTxConfirmations();
@@ -145,12 +130,16 @@ contract MultiSigWallet {
 
         el.executed = true;
 
-        (, bytes memory result) = address(el.to).call{value: el.value}(el.data);
+        (bool success, bytes memory result) = el.to.call{value: el.value}(el.data);
+
+        if (!success) {
+            revert MultiSigWallet__FailedToExecuteTx();
+        }
 
         emit TxExecuted(_nonce, result);
     }
 
-    function revokeTx(uint256 _nonce) external onlySigners validTx(_nonce) {
+    function revokeTx(uint256 _nonce) external nonReentrant onlySigners validTx(_nonce) {
         if (!txConfirmers[_nonce][msg.sender]) {
             revert MultiSigWallet__CannotRevokeYet();
         }
@@ -160,19 +149,22 @@ contract MultiSigWallet {
         emit TransactionRevoked(_nonce, msg.sender);
     }
 
-    function isUnique(
-        address[] memory _accounts
-    ) internal pure returns (int, int) {
-        if (_accounts.length <= 1) {
+    function isUnique(address[] memory _accounts) internal pure returns (int256, int256) {
+        if (_accounts.length == 1) {
+            revertIfZeroAddr(_accounts[0]);
+        }
+        if (_accounts.length == 0) {
             return (-1, -1);
         }
-        for (uint i = 0; i < _accounts.length; i++) {
+        for (uint256 i = 0; i < _accounts.length; i++) {
             if (_accounts[i] == address(0)) {
                 revert MultiSigWallet__InvalidSigner();
             }
-            for (uint j = _accounts.length - 1; j > i; j--) {
+            revertIfZeroAddr(_accounts[i]);
+            for (uint256 j = _accounts.length - 1; j > i; j--) {
+                revertIfZeroAddr(_accounts[j]);
                 if (_accounts[i] == _accounts[j]) {
-                    return (int(i), int(j));
+                    return (int256(i), int256(j));
                 }
             }
         }
@@ -189,7 +181,14 @@ contract MultiSigWallet {
         return false;
     }
 
+    function revertIfZeroAddr(address _addr) internal pure {
+        if (_addr == address(0)) {
+            revert MultiSigWallet__InvalidSigner();
+        }
+    }
+
     function checkTxValidation(uint256 _nonce) internal view {
+        if (_nonce >= nonce) revert MultiSigWallet__InvalidNonce();
         if (block.timestamp > nonceToTx[_nonce].deadline) {
             revert MultiSigWallet__Expired(nonceToTx[_nonce].deadline);
         }
@@ -207,10 +206,7 @@ contract MultiSigWallet {
         return signers;
     }
 
-    function hasConfirmed(
-        uint256 _nonce,
-        address _signer
-    ) external view returns (bool) {
+    function hasConfirmed(uint256 _nonce, address _signer) external view returns (bool) {
         return txConfirmers[_nonce][_signer];
     }
 
@@ -227,5 +223,7 @@ contract MultiSigWallet {
     }
 
     // Allow contract to receive ETH
-    receive() external payable {}
+    receive() external payable {
+        emit Deposit(address(msg.sender), msg.value);
+    }
 }
